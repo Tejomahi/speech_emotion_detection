@@ -1,72 +1,74 @@
 
-import os
-import tempfile
-from io import BytesIO
-
-import librosa
-import numpy as np
+import io
 import requests
 import streamlit as st
+import numpy as np
+import librosa
 import torch
 import torch.nn as nn
+
 from transformers import Wav2Vec2Model
 
 
-# ============================================
-# 1. APPLICATION SETTINGS
-# ============================================
+# --------------------------------------------------
+# 1. PAGE CONFIGURATION
+# --------------------------------------------------
 
 st.set_page_config(
-    page_title="Speech Emotion Detection",
+    page_title="Speech Emotion Recognition",
     page_icon="🎙️",
     layout="centered"
 )
 
-st.title("🎙️ Speech Emotion Detection")
+st.title("🎙️ Speech Emotion Recognition")
 st.write(
-    "Detect emotions in speech using a deep learning model."
+    "Upload an audio file or record your voice to identify "
+    "the emotion expressed in the speech."
 )
 
-device = torch.device(
-    "cuda" if torch.cuda.is_available() else "cpu"
-)
 
-NUM_CLASSES = 8
-
-emotion_labels = {
-    0: "Neutral",
-    1: "Calm",
-    2: "Happy",
-    3: "Sad",
-    4: "Angry",
-    5: "Fearful",
-    6: "Disgust",
-    7: "Surprised"
-}
+# --------------------------------------------------
+# 2. MODEL CONFIGURATION
+# --------------------------------------------------
 
 MODEL_URL = (
     "https://huggingface.co/Tejomahi/"
     "speech_emotion_detection_model/resolve/main/"
-    "final_model_ravdess_sp_emotion.pth"
+    "final_speech_emotion_detection_model.pth"
 )
 
+MODEL_NAME = "superb/wav2vec2-base-superb-er"
 
-# ============================================
-# 2. MODEL ARCHITECTURE
-# Must match the training notebook
-# ============================================
+EMOTIONS = [
+    "neutral",
+    "calm",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgust",
+    "surprised"
+]
+
+SAMPLE_RATE = 16000
+AUDIO_DURATION = 4
+NUM_SAMPLES = SAMPLE_RATE * AUDIO_DURATION
+
+DEVICE = torch.device("cpu")
+
+
+# --------------------------------------------------
+# 3. MODEL ARCHITECTURE
+# Must match the architecture used during training.
+# --------------------------------------------------
 
 class EmotionClassifier(nn.Module):
 
-    def __init__(
-        self,
-        num_classes=NUM_CLASSES,
-        freeze_backbone=True
-    ):
+    def __init__(self, num_classes=8, freeze_backbone=True):
         super().__init__()
 
         self.backbone = Wav2Vec2Model.from_pretrained(
-            "superb/wav2vec2-base-superb-er"
+            MODEL_NAME
         )
 
         if freeze_backbone:
@@ -96,9 +98,8 @@ class EmotionClassifier(nn.Module):
 
     def forward(self, audio):
 
-        with torch.no_grad():
-            outputs = self.backbone(audio)
-            hidden_states = outputs.last_hidden_state
+        outputs = self.backbone(audio)
+        hidden_states = outputs.last_hidden_state
 
         mean_pool = torch.mean(hidden_states, dim=1)
         max_pool = torch.max(hidden_states, dim=1)[0]
@@ -108,211 +109,242 @@ class EmotionClassifier(nn.Module):
             dim=1
         )
 
-        return self.classifier(pooled)
+        logits = self.classifier(pooled)
+
+        return logits
 
 
-# ============================================
-# 3. LOAD MODEL FROM HUGGING FACE
-# ============================================
+# --------------------------------------------------
+# 4. DOWNLOAD AND LOAD THE TRAINED MODEL
+# --------------------------------------------------
 
-@st.cache_resource
+@st.cache_resource(show_spinner="Loading the trained AI model...")
 def load_model():
-
-    model = EmotionClassifier(
-        num_classes=NUM_CLASSES,
-        freeze_backbone=True
-    )
 
     response = requests.get(
         MODEL_URL,
         timeout=300
     )
+
     response.raise_for_status()
 
     checkpoint = torch.load(
-        BytesIO(response.content),
-        map_location="cpu",
+        io.BytesIO(response.content),
+        map_location=DEVICE,
         weights_only=True
     )
 
+    model = EmotionClassifier(
+        num_classes=len(EMOTIONS),
+        freeze_backbone=True
+    )
+
     model.load_state_dict(checkpoint)
-    model.to(device)
+
+    model.to(DEVICE)
     model.eval()
 
     return model
 
 
-# ============================================
-# 4. AUDIO PREDICTION
-# ============================================
+# --------------------------------------------------
+# 5. PREPROCESS AUDIO
+# Convert audio to mono, 16 kHz, and 4 seconds.
+# --------------------------------------------------
 
-def predict_emotion(audio_path):
+def preprocess_audio(audio_file):
 
-    waveform, sr = librosa.load(
-        audio_path,
-        sr=16000,
+    audio_file.seek(0)
+
+    audio_bytes = audio_file.read()
+
+    audio, _ = librosa.load(
+        io.BytesIO(audio_bytes),
+        sr=SAMPLE_RATE,
         mono=True
     )
 
-    if len(waveform) == 0:
+    if len(audio) == 0:
         raise ValueError("The audio file is empty.")
 
-    # Use exactly 4 seconds, as in the inference setup
-    max_length = 16000 * 4
+    # Pad short audio or truncate long audio.
+    if len(audio) < NUM_SAMPLES:
 
-    if len(waveform) < max_length:
-        waveform = np.pad(
-            waveform,
-            (0, max_length - len(waveform))
+        audio = np.pad(
+            audio,
+            (0, NUM_SAMPLES - len(audio)),
+            mode="constant"
         )
+
     else:
-        waveform = waveform[:max_length]
+        audio = audio[:NUM_SAMPLES]
 
-    audio_tensor = torch.tensor(
-        waveform,
+    audio = np.asarray(audio, dtype=np.float32)
+
+    return torch.tensor(
+        audio,
         dtype=torch.float32
-    ).unsqueeze(0).to(device)
-
-    with torch.no_grad():
-        outputs = model(audio_tensor)
-        probabilities = torch.softmax(outputs, dim=1)
-
-    confidence, predicted_class = torch.max(
-        probabilities,
-        dim=1
-    )
-
-    emotion = emotion_labels[predicted_class.item()]
-    confidence_percent = confidence.item() * 100
-
-    probability_values = (
-        probabilities[0].cpu().numpy() * 100
-    )
-
-    return emotion, confidence_percent, probability_values
+    ).unsqueeze(0)
 
 
-# ============================================
-# 5. DISPLAY PREDICTION
-# ============================================
+# --------------------------------------------------
+# 6. PREDICT EMOTION
+# --------------------------------------------------
 
-def show_prediction(audio_bytes, suffix):
+def predict_emotion(model, audio_file):
 
-    temp_path = None
+    input_audio = preprocess_audio(audio_file)
+    input_audio = input_audio.to(DEVICE)
+
+    with torch.inference_mode():
+
+        logits = model(input_audio)
+
+        probabilities = torch.softmax(
+            logits,
+            dim=1
+        )[0]
+
+        predicted_index = torch.argmax(
+            probabilities
+        ).item()
+
+    predicted_emotion = EMOTIONS[predicted_index]
+    confidence = probabilities[predicted_index].item() * 100
+
+    probability_results = {
+        EMOTIONS[i]: float(probabilities[i].item() * 100)
+        for i in range(len(EMOTIONS))
+    }
+
+    return predicted_emotion, confidence, probability_results
+
+
+# --------------------------------------------------
+# 7. DISPLAY RESULTS
+# --------------------------------------------------
+
+def display_prediction(audio_file):
 
     try:
-        with tempfile.NamedTemporaryFile(
-            delete=False,
-            suffix=suffix
-        ) as temp_file:
-            temp_file.write(audio_bytes)
-            temp_path = temp_file.name
+        with st.spinner("Analyzing your voice..."):
 
-        with st.spinner("Analyzing your audio..."):
+            model = load_model()
 
-            emotion, confidence, probabilities = (
-                predict_emotion(temp_path)
+            emotion, confidence, probabilities = predict_emotion(
+                model,
+                audio_file
             )
 
-        st.success(f"🎭 Detected Emotion: {emotion}")
-        st.metric(
-            "Model Confidence",
-            f"{confidence:.2f}%"
+        st.success("Emotion analysis completed!")
+
+        st.subheader("Predicted Emotion")
+
+        st.markdown(
+            f"## 🎯 {emotion.capitalize()}"
         )
 
-        st.subheader("Emotion Probabilities")
+        st.metric(
+            label="Model confidence",
+            value=f"{confidence:.2f}%"
+        )
 
-        for index, value in enumerate(probabilities):
-            st.write(
-                f"{emotion_labels[index]}: {value:.2f}%"
+        st.subheader("Emotion Probability Scores")
+
+        sorted_probabilities = dict(
+            sorted(
+                probabilities.items(),
+                key=lambda item: item[1],
+                reverse=True
             )
+        )
+
+        for label, score in sorted_probabilities.items():
+
+            st.write(
+                f"**{label.capitalize()} — {score:.2f}%**"
+            )
+
             st.progress(
-                float(value / 100)
+                min(max(int(round(score)), 0), 100)
             )
 
         st.caption(
-            "Predictions are estimates from the trained model, "
-            "not definitive measurements of a person's feelings."
+            "These percentages are model scores, not a definitive "
+            "measurement of a person's actual emotional state."
         )
+
+    except requests.exceptions.HTTPError as error:
+
+        st.error(
+            "The model file could not be downloaded from Hugging Face."
+        )
+
+        st.write(
+            "Please check that the model file has finished uploading, "
+            "is in the main branch, and has the exact filename:"
+        )
+
+        st.code("final_speech_emotion_detection_model.pth")
+
+        st.caption(f"Details: {error}")
 
     except Exception as error:
+
         st.error(
-            f"Could not process the audio: {error}"
+            "Unable to analyze this audio. Please try another "
+            "clear WAV, MP3, OGG, FLAC, or M4A recording."
         )
 
-    finally:
-        if temp_path and os.path.exists(temp_path):
-            os.remove(temp_path)
+        st.caption(f"Technical details: {error}")
 
 
-# ============================================
-# 6. LOAD MODEL
-# ============================================
-
-try:
-    with st.spinner(
-        "Loading the emotion model. "
-        "The first launch may take several minutes..."
-    ):
-        model = load_model()
-
-    st.success("Model loaded successfully.")
-
-except Exception as error:
-    st.error("The model could not be loaded.")
-    st.code(str(error))
-    st.info(
-        "Check the Hugging Face model filename, repository "
-        "access, network connection, and deployment logs."
-    )
-    st.stop()
-
-
-# ============================================
-# 7. INPUT METHOD A: AUDIO FILE UPLOAD
-# ============================================
+# --------------------------------------------------
+# 8. AUDIO FILE UPLOAD
+# --------------------------------------------------
 
 st.divider()
-st.subheader("📁 Upload an Audio File")
+
+st.subheader("📁 Option 1: Upload an Audio File")
 
 uploaded_file = st.file_uploader(
-    "Choose an audio recording",
-    type=["wav", "mp3", "ogg", "flac", "m4a"]
+    "Choose an audio file",
+    type=["wav", "mp3", "ogg", "flac", "m4a"],
+    key="uploaded_audio"
 )
 
 if uploaded_file is not None:
 
-    st.audio(uploaded_file)
+    st.audio(
+        uploaded_file,
+        format=uploaded_file.type
+    )
 
     if st.button(
-        "🔍 Detect Emotion from File",
-        key="file_predict"
+        "Analyze Uploaded Audio",
+        type="primary",
+        use_container_width=True
     ):
-        suffix = os.path.splitext(
-            uploaded_file.name
-        )[1].lower()
 
-        show_prediction(
-            uploaded_file.getvalue(),
-            suffix or ".wav"
-        )
+        display_prediction(uploaded_file)
 
 
-# ============================================
-# 8. INPUT METHOD B: MICROPHONE RECORDING
-# ============================================
+# --------------------------------------------------
+# 9. MICROPHONE RECORDING
+# --------------------------------------------------
 
 st.divider()
-st.subheader("🎙️ Record Using Your Microphone")
+
+st.subheader("🎤 Option 2: Record Your Voice")
 
 st.write(
-    "Allow microphone access in your browser, "
-    "record your speech, and submit the recording."
+    "Click the recording control below, record your voice, "
+    "and finish the recording."
 )
 
 recorded_audio = st.audio_input(
     "Record your voice",
-    sample_rate=16000
+    key="recorded_audio"
 )
 
 if recorded_audio is not None:
@@ -320,22 +352,21 @@ if recorded_audio is not None:
     st.audio(recorded_audio)
 
     if st.button(
-        "🔍 Detect Emotion from Recording",
-        key="mic_predict"
+        "Analyze Recorded Voice",
+        type="primary",
+        use_container_width=True
     ):
-        show_prediction(
-            recorded_audio.getvalue(),
-            ".wav"
-        )
+
+        display_prediction(recorded_audio)
 
 
-# ============================================
-# 9. FOOTER
-# ============================================
+# --------------------------------------------------
+# 10. FOOTER
+# --------------------------------------------------
 
 st.divider()
 
 st.caption(
-    "SpeechSense | Deep Learning-Based Speech "
-    "Emotion Recognition | 8 emotion classes"
+    "Speech Emotion Recognition using Deep Learning "
+    "and Wav2Vec2 | Academic Project"
 )
