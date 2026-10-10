@@ -4,3 +4,4 @@ transformers
 librosa
 numpy
 soundfile
+requests
