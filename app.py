@@ -1,5 +1,4 @@
-
-    probability_results = {
+probability_results = {
         EMOTIONS[i]: float(probabilities[i].item() * 100)
         for i in range(len(EMOTIONS))
     }
