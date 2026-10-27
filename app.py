@@ -1,10 +1,8 @@
 probability_results = {
         EMOTIONS[i]: float(probabilities[i].item() * 100)
         for i in range(len(EMOTIONS))
-    }
-    return predicted_emotion, confidence, probability_results
-
-
+}
+return predicted_emotion, confidence, probability_results
 # --------------------------------------------------
 # 7. DISPLAY RESULTS
 # --------------------------------------------------
