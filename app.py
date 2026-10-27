@@ -1,4 +1,3 @@
-
                 reverse=True
             )
         )
@@ -114,4 +113,3 @@ st.caption(
     "Speech Emotion Recognition using Deep Learning "
     "and Wav2Vec2 | Academic Project"
 )
-
