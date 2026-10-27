@@ -1,115 +1,96 @@
-                reverse=True
-            )
-        )
+import io
+import requests
+import streamlit as st
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
 
-        for label, score in sorted_probabilities.items():
-
-            st.write(
-                f"**{label.capitalize()} — {score:.2f}%**"
-            )
-
-            st.progress(
-                min(max(int(round(score)), 0), 100)
-            )
-
-        st.caption(
-            "These percentages are model scores, not a definitive "
-            "measurement of a person's actual emotional state."
-        )
-
-    except requests.exceptions.HTTPError as error:
-
-        st.error(
-            "The model file could not be downloaded from Hugging Face."
-        )
-
-        st.write(
-            "Please check that the model file has finished uploading, "
-            "is in the main branch, and has the exact filename:"
-        )
-
-        st.code("final_model_ravdess_sp_emotion.pth")
-
-        st.caption(f"Details: {error}")
-
-    except Exception as error:
-
-        st.error(
-            "Unable to analyze this audio. Please try another "
-            "clear WAV, MP3, OGG, FLAC, or M4A recording."
-        )
-
-        st.caption(f"Technical details: {error}")
+from transformers import Wav2Vec2Model
 
 
 # --------------------------------------------------
-# 8. AUDIO FILE UPLOAD
+# 1. PAGE CONFIGURATION
 # --------------------------------------------------
 
-st.divider()
-
-st.subheader("📁 Option 1: Upload an Audio File")
-
-uploaded_file = st.file_uploader(
-    "Choose an audio file",
-    type=["wav", "mp3", "ogg", "flac", "m4a"],
-    key="uploaded_audio"
+st.set_page_config(
+    page_title="Speech Emotion Recognition",
+    page_icon="🎙️",
+    layout="centered"
 )
 
-if uploaded_file is not None:
-
-    st.audio(
-        uploaded_file,
-        format=uploaded_file.type
-    )
-
-    if st.button(
-        "Analyze Uploaded Audio",
-        type="primary",
-        use_container_width=True
-    ):
-
-        display_prediction(uploaded_file)
-
-
-# --------------------------------------------------
-# 9. MICROPHONE RECORDING
-# --------------------------------------------------
-
-st.divider()
-
-st.subheader("🎤 Option 2: Record Your Voice")
-
+st.title("🎙️ Speech Emotion Recognition")
 st.write(
-    "Click the recording control below, record your voice, "
-    "and finish the recording."
+    "Upload an audio file or record your voice to identify "
+    "the emotion expressed in the speech."
 )
-
-recorded_audio = st.audio_input(
-    "Record your voice",
-    key="recorded_audio"
-)
-
-if recorded_audio is not None:
-
-    st.audio(recorded_audio)
-
-    if st.button(
-        "Analyze Recorded Voice",
-        type="primary",
-        use_container_width=True
-    ):
-
-        display_prediction(recorded_audio)
 
 
 # --------------------------------------------------
-# 10. FOOTER
+# 2. MODEL CONFIGURATION
 # --------------------------------------------------
 
-st.divider()
-
-st.caption(
-    "Speech Emotion Recognition using Deep Learning "
-    "and Wav2Vec2 | Academic Project"
+MODEL_URL = (
+    "https://huggingface.co/Tejomahi/"
+    "speech_emotion_detection_model/resolve/main/"
+    "final_model_ravdess_sp_emotion.pth"
 )
+
+MODEL_NAME = "superb/wav2vec2-base-superb-er"
+
+EMOTIONS = [
+    "neutral",
+    "calm",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgust",
+    "surprised"
+]
+
+SAMPLE_RATE = 16000
+AUDIO_DURATION = 4
+NUM_SAMPLES = SAMPLE_RATE * AUDIO_DURATION
+
+DEVICE = torch.device("cpu")
+
+
+# --------------------------------------------------
+# 3. MODEL ARCHITECTURE
+# Must match the architecture used during training.
+# --------------------------------------------------
+
+class EmotionClassifier(nn.Module):
+
+    def __init__(self, num_classes=8, freeze_backbone=True):
+        super().__init__()
+
+        self.backbone = Wav2Vec2Model.from_pretrained(
+            MODEL_NAME
+        )
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        hidden_size = self.backbone.config.hidden_size
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.3),
+
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.2),
+
+            nn.Linear(128, num_classes)
+        )
