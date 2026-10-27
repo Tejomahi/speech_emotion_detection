@@ -1,23 +1,207 @@
-probability_results = {
+
+import io
+import requests
+import streamlit as st
+import numpy as np
+import librosa
+import torch
+import torch.nn as nn
+from transformers import Wav2Vec2Model
+
+
+# --------------------------------------------------
+# 1. PAGE CONFIGURATION
+# --------------------------------------------------
+st.set_page_config(
+    page_title="Speech Emotion Recognition",
+    page_icon="🎙️",
+    layout="centered",
+)
+
+st.title("🎙️ Speech Emotion Recognition")
+st.write(
+    "Upload an audio file or record your voice to identify "
+    "the emotion expressed in the speech."
+)
+
+
+# --------------------------------------------------
+# 2. MODEL CONFIGURATION
+# --------------------------------------------------
+MODEL_URL = (
+    "https://huggingface.co/Tejomahi/"
+    "speech_emotion_detection_model/resolve/main/"
+    "final_model_ravdess_sp_emotion.pth"
+)
+
+MODEL_NAME = "superb/wav2vec2-base-superb-er"
+
+EMOTIONS = [
+    "neutral",
+    "calm",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgust",
+    "surprised",
+]
+
+SAMPLE_RATE = 16000
+AUDIO_DURATION = 4
+NUM_SAMPLES = SAMPLE_RATE * AUDIO_DURATION
+DEVICE = torch.device("cpu")
+
+
+# --------------------------------------------------
+# 3. MODEL ARCHITECTURE
+# This architecture must match the training code.
+# --------------------------------------------------
+class EmotionClassifier(nn.Module):
+    def __init__(self, num_classes=8, freeze_backbone=True):
+        super().__init__()
+
+        self.backbone = Wav2Vec2Model.from_pretrained(MODEL_NAME)
+
+        if freeze_backbone:
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+
+        hidden_size = self.backbone.config.hidden_size
+
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size * 2, 512),
+            nn.ReLU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.BatchNorm1d(256),
+            nn.Dropout(0.3),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.2),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, audio):
+        outputs = self.backbone(audio)
+        hidden_states = outputs.last_hidden_state
+
+        mean_pool = torch.mean(hidden_states, dim=1)
+        max_pool = torch.max(hidden_states, dim=1)[0]
+
+        pooled = torch.cat([mean_pool, max_pool], dim=1)
+
+        return self.classifier(pooled)
+
+
+# --------------------------------------------------
+# 4. DOWNLOAD AND LOAD THE TRAINED MODEL
+# --------------------------------------------------
+@st.cache_resource(show_spinner="Loading the trained AI model...")
+def load_model():
+    response = requests.get(MODEL_URL, timeout=300)
+    response.raise_for_status()
+
+    checkpoint = torch.load(
+        io.BytesIO(response.content),
+        map_location=DEVICE,
+        weights_only=True,
+    )
+
+    model = EmotionClassifier(
+        num_classes=len(EMOTIONS),
+        freeze_backbone=True,
+    )
+
+    model.load_state_dict(checkpoint)
+    model.to(DEVICE)
+    model.eval()
+
+    return model
+
+
+# --------------------------------------------------
+# 5. AUDIO PREPROCESSING
+# Convert audio to mono, 16 kHz, and 4 seconds.
+# --------------------------------------------------
+def preprocess_audio(audio_file):
+    audio_file.seek(0)
+    audio_bytes = audio_file.read()
+
+    audio, _ = librosa.load(
+        io.BytesIO(audio_bytes),
+        sr=SAMPLE_RATE,
+        mono=True,
+    )
+
+    if len(audio) == 0:
+        raise ValueError("The audio file is empty.")
+
+    if len(audio) < NUM_SAMPLES:
+        audio = np.pad(
+            audio,
+            (0, NUM_SAMPLES - len(audio)),
+            mode="constant",
+        )
+    else:
+        audio = audio[:NUM_SAMPLES]
+
+    audio = np.asarray(audio, dtype=np.float32)
+
+    return torch.tensor(
+        audio,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+
+
+# --------------------------------------------------
+# 6. PREDICT EMOTION
+# --------------------------------------------------
+def predict_emotion(model, audio_file):
+    input_audio = preprocess_audio(audio_file).to(DEVICE)
+
+    with torch.inference_mode():
+        logits = model(input_audio)
+        probabilities = torch.softmax(logits, dim=1)[0]
+        predicted_index = torch.argmax(probabilities).item()
+
+    predicted_emotion = EMOTIONS[predicted_index]
+    confidence = probabilities[predicted_index].item() * 100
+
+    probability_results = {
         EMOTIONS[i]: float(probabilities[i].item() * 100)
         for i in range(len(EMOTIONS))
-}
-return predicted_emotion, confidence, probability_results
+    }
+
+    return predicted_emotion, confidence, probability_results
+
+
 # --------------------------------------------------
-# 7. DISPLAY RESULTS
+# 7. DISPLAY PREDICTION RESULTS
 # --------------------------------------------------
 def display_prediction(audio_file):
     try:
         with st.spinner("Analyzing your voice..."):
             model = load_model()
+
             emotion, confidence, probabilities = predict_emotion(
-                model, audio_file
+                model,
+                audio_file,
             )
 
         st.success("Emotion analysis completed!")
+
         st.subheader("Predicted Emotion")
         st.markdown(f"## 🎯 {emotion.capitalize()}")
-        st.metric("Model confidence", f"{confidence:.2f}%")
+
+        st.metric(
+            "Model confidence",
+            f"{confidence:.2f}%",
+        )
+
         st.subheader("Emotion Probability Scores")
 
         sorted_probabilities = dict(
@@ -30,7 +214,9 @@ def display_prediction(audio_file):
 
         for label, score in sorted_probabilities.items():
             st.write(f"**{label.capitalize()} — {score:.2f}%**")
-            st.progress(min(max(int(round(score)), 0), 100))
+            st.progress(
+                min(max(int(round(score)), 0), 100)
+            )
 
         st.caption(
             "These percentages are model scores, not a definitive "
@@ -38,24 +224,30 @@ def display_prediction(audio_file):
         )
 
     except requests.exceptions.HTTPError as error:
-        st.error("The model file could not be downloaded from Hugging Face.")
+        st.error(
+            "The trained model could not be downloaded from Hugging Face."
+        )
         st.write(
-            "Check that the repository is accessible and that the file "
-            "is in the main branch with this exact filename:"
+            "Check that the model repository is accessible and the "
+            "checkpoint filename is correct."
         )
         st.code("final_model_ravdess_sp_emotion.pth")
         st.caption(f"Technical details: {error}")
 
     except requests.exceptions.RequestException as error:
-        st.error("Could not connect to Hugging Face to download the model.")
+        st.error(
+            "Could not connect to Hugging Face to download the model."
+        )
         st.caption(f"Technical details: {error}")
 
     except Exception as error:
-        st.error(
-            "Unable to analyze this audio. Please try another clear "
-            "WAV, MP3, OGG, FLAC, or M4A recording."
+        st.error("Unable to analyze this audio.")
+        st.write(
+            "Please try a clear WAV, MP3, OGG, FLAC, or M4A recording."
         )
-        st.caption(f"Technical details: {error}")
+        st.caption(
+            f"Technical details: {type(error).__name__}: {error}"
+        )
 
 
 # --------------------------------------------------
@@ -71,12 +263,13 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-    st.audio(uploaded_file, format=uploaded_file.type)
+    st.audio(uploaded_file)
 
     if st.button(
         "Analyze Uploaded Audio",
         type="primary",
         use_container_width=True,
+        key="analyze_uploaded",
     ):
         display_prediction(uploaded_file)
 
@@ -86,6 +279,7 @@ if uploaded_file is not None:
 # --------------------------------------------------
 st.divider()
 st.subheader("🎤 Option 2: Record Your Voice")
+
 st.write(
     "Use the recording control below, record your voice, "
     "and finish the recording."
@@ -103,6 +297,7 @@ if recorded_audio is not None:
         "Analyze Recorded Voice",
         type="primary",
         use_container_width=True,
+        key="analyze_recorded",
     ):
         display_prediction(recorded_audio)
 
@@ -111,6 +306,7 @@ if recorded_audio is not None:
 # 10. FOOTER
 # --------------------------------------------------
 st.divider()
+
 st.caption(
     "Speech Emotion Recognition using Deep Learning "
     "and Wav2Vec2 | Academic Project"
